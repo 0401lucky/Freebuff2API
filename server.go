@@ -14,34 +14,62 @@ import (
 )
 
 type Server struct {
-	cfg     Config
-	logger  *log.Logger
+	cfg      Config
+	logger   *log.Logger
 	client   *UpstreamClient
 	runs     *RunManager
 	registry *ModelRegistry
+	accounts *AccountManager
+	sessions *SessionManager
 	started  time.Time
 }
 
-func NewServer(cfg Config, logger *log.Logger, registry *ModelRegistry) *Server {
-	client := NewUpstreamClient(cfg)
-	runManager := NewRunManager(cfg, client, logger)
-
+func NewServer(
+	cfg Config,
+	logger *log.Logger,
+	registry *ModelRegistry,
+	client *UpstreamClient,
+	runs *RunManager,
+	accounts *AccountManager,
+	sessions *SessionManager,
+) *Server {
 	return &Server{
-		cfg:     cfg,
-		logger:  logger,
+		cfg:      cfg,
+		logger:   logger,
 		client:   client,
-		runs:     runManager,
+		runs:     runs,
 		registry: registry,
+		accounts: accounts,
+		sessions: sessions,
 		started:  time.Now(),
 	}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", s.handleHealthz)
-	mux.HandleFunc("/v1/models", s.handleModels)
-	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
-	return s.withMiddleware(mux)
+
+	mux.Handle("/healthz", s.requireAPIKey(http.HandlerFunc(s.handleHealthz)))
+	mux.Handle("/v1/models", s.requireAPIKey(http.HandlerFunc(s.handleModels)))
+	mux.Handle("/v1/chat/completions", s.requireAPIKey(http.HandlerFunc(s.handleChatCompletions)))
+
+	if s.sessions != nil && s.sessions.Enabled() {
+		mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})
+		mux.HandleFunc("/", s.handleIndex)
+		mux.HandleFunc("/app.css", s.handleCSS)
+		mux.HandleFunc("/app.js", s.handleJS)
+		mux.HandleFunc("/web/login", s.handleWebLogin)
+		mux.HandleFunc("/web/logout", s.handleWebLogout)
+		mux.HandleFunc("/web/session", s.handleWebSession)
+		mux.Handle("/web/api/healthz", s.requireSession(http.HandlerFunc(s.handleWebHealthz)))
+		mux.Handle("/web/api/models", s.requireSession(http.HandlerFunc(s.handleWebModels)))
+		mux.Handle("/web/api/chat/completions", s.requireSession(http.HandlerFunc(s.handleWebChatCompletions)))
+		mux.Handle("/web/api/accounts", s.requireSession(http.HandlerFunc(s.handleWebAccountsCollection)))
+		mux.Handle("/web/api/accounts/", s.requireSession(http.HandlerFunc(s.handleWebAccountItem)))
+	}
+
+	return mux
 }
 
 func (s *Server) Start(ctx context.Context) {
@@ -52,10 +80,33 @@ func (s *Server) Shutdown(ctx context.Context) {
 	s.runs.Close(ctx)
 }
 
-func (s *Server) withMiddleware(next http.Handler) http.Handler {
+func (s *Server) requireAPIKey(next http.Handler) http.Handler {
+	if len(s.cfg.APIKeys) == 0 {
+		return next
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(s.cfg.APIKeys) > 0 && !s.authorized(r) {
+		if !s.authorized(r) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid proxy api key", "authentication_error", "")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) requireSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.sessions == nil || !s.sessions.Enabled() {
+			http.NotFound(w, r)
+			return
+		}
+		cookie, err := r.Cookie(sessionCookieName)
+		if err != nil || !s.sessions.Valid(cookie.Value) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": map[string]any{
+					"message": "未登录或会话已过期",
+					"type":    "authentication_error",
+				},
+			})
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -80,14 +131,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
 		return
 	}
-
-	response := map[string]any{
-		"ok":          true,
-		"started_at":  s.started.UTC(),
-		"uptime_sec":  int(time.Since(s.started).Seconds()),
-		"token_state": s.runs.Snapshots(),
-	}
-	writeJSON(w, http.StatusOK, response)
+	writeJSON(w, http.StatusOK, s.healthPayload())
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -95,28 +139,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
 		return
 	}
-
-	created := s.started.Unix()
-	modelsList := s.registry.Models()
-	models := make([]map[string]any, 0, len(modelsList))
-	for _, model := range modelsList {
-		models = append(models, map[string]any{
-			"id":         model,
-			"object":     "model",
-			"created":    created,
-			"owned_by":   "Freebuff-Go",
-			"root":       model,
-			"permission": []any{},
-		})
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"object": "list",
-		"data":   models,
-	})
+	writeJSON(w, http.StatusOK, s.modelsPayload())
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	s.proxyChatCompletions(w, r)
+}
+
+func (s *Server) proxyChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
 		return
@@ -155,7 +185,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.name, requestedModel, lease.run.id)
+		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.label, requestedModel, lease.run.id)
 
 		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id)
 		if err != nil {
@@ -176,26 +206,28 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			copyHeaders(w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
 			if err := copyResponseBody(w, resp.Body); err != nil && !errors.Is(err, context.Canceled) {
-				s.logger.Printf("[%s] proxy response copy failed: %v", lease.pool.name, err)
+				s.logger.Printf("[%s] proxy response copy failed: %v", lease.pool.label, err)
 			}
-			s.logger.Printf("[%s] Request completed successfully in %v (status: %d)", lease.pool.name, time.Since(startTime).Round(time.Millisecond), resp.StatusCode)
+			s.logger.Printf("[%s] Request completed successfully in %v (status: %d)", lease.pool.label, time.Since(startTime).Round(time.Millisecond), resp.StatusCode)
 			s.runs.Release(lease)
 			return
 		}
 
 		if isRunInvalid(resp.StatusCode, errorBody) {
-			s.logger.Printf("%s: run %s invalid, rotating and retrying", lease.pool.name, lease.run.id)
+			s.logger.Printf("%s: run %s invalid, rotating and retrying", lease.pool.label, lease.run.id)
 			s.runs.Invalidate(lease, strings.TrimSpace(string(errorBody)))
 			s.runs.Release(lease)
 			continue
 		}
 
 		if resp.StatusCode == http.StatusUnauthorized {
-			s.runs.Cooldown(lease, 30*time.Minute, "upstream auth rejected token")
+			reason := "upstream auth rejected token"
+			s.runs.Cooldown(lease, 30*time.Minute, reason)
+			s.accounts.MarkInvalid(context.Background(), lease.pool.accountID, reason)
 		}
 
 		s.runs.Release(lease)
-		s.logger.Printf("[%s] upstream error response: %s", lease.pool.name, string(errorBody))
+		s.logger.Printf("[%s] upstream error response: %s", lease.pool.label, string(errorBody))
 		writePassthroughError(w, resp.StatusCode, errorBody)
 		return
 	}
@@ -221,6 +253,243 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 		return nil, fmt.Errorf("marshal upstream request: %w", err)
 	}
 	return body, nil
+}
+
+func (s *Server) healthPayload() map[string]any {
+	return map[string]any{
+		"ok":                    true,
+		"started_at":            s.started.UTC(),
+		"uptime_sec":            int(time.Since(s.started).Seconds()),
+		"token_state":           s.runs.Snapshots(),
+		"account_store_enabled": s.accounts.Enabled(),
+	}
+}
+
+func (s *Server) modelsPayload() map[string]any {
+	created := s.started.Unix()
+	modelsList := s.registry.Models()
+	models := make([]map[string]any, 0, len(modelsList))
+	for _, model := range modelsList {
+		models = append(models, map[string]any{
+			"id":         model,
+			"object":     "model",
+			"created":    created,
+			"owned_by":   "Freebuff-Go",
+			"root":       model,
+			"permission": []any{},
+		})
+	}
+
+	return map[string]any{
+		"object": "list",
+		"data":   models,
+	}
+}
+
+func (s *Server) handleWebLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": map[string]any{"message": "method not allowed"}})
+		return
+	}
+	var payload struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "请求体不是合法 JSON"}})
+		return
+	}
+	if !s.sessions.Authenticate(strings.TrimSpace(payload.Password)) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"message": "访问密码错误"}})
+		return
+	}
+
+	token := s.sessions.Create()
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   requestIsSecure(r),
+		Expires:  time.Now().Add(24 * time.Hour),
+	})
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleWebLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": map[string]any{"message": "method not allowed"}})
+		return
+	}
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		s.sessions.Destroy(cookie.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   requestIsSecure(r),
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleWebSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": map[string]any{"message": "method not allowed"}})
+		return
+	}
+	authenticated := false
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		authenticated = s.sessions.Valid(cookie.Value)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":               s.sessions.Enabled(),
+		"authenticated":         authenticated,
+		"account_store_enabled": s.accounts.Enabled(),
+	})
+}
+
+func (s *Server) handleWebHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": map[string]any{"message": "method not allowed"}})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.healthPayload())
+}
+
+func (s *Server) handleWebModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": map[string]any{"message": "method not allowed"}})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.modelsPayload())
+}
+
+func (s *Server) handleWebChatCompletions(w http.ResponseWriter, r *http.Request) {
+	s.proxyChatCompletions(w, r)
+}
+
+func (s *Server) handleWebAccountsCollection(w http.ResponseWriter, r *http.Request) {
+	if !s.accounts.Enabled() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "账号池存储未启用"}})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		accounts, err := s.accounts.List(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"message": err.Error()}})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": accounts})
+	case http.MethodPost:
+		var payload struct {
+			Label    string `json:"label"`
+			Token    string `json:"token"`
+			Enabled  bool   `json:"enabled"`
+			Priority int    `json:"priority"`
+			Weight   int    `json:"weight"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "请求体不是合法 JSON"}})
+			return
+		}
+		account, err := s.accounts.Create(r.Context(), AccountInput{
+			Label:    payload.Label,
+			Token:    payload.Token,
+			Enabled:  payload.Enabled,
+			Priority: payload.Priority,
+			Weight:   payload.Weight,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error()}})
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"data": account})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": map[string]any{"message": "method not allowed"}})
+	}
+}
+
+func (s *Server) handleWebAccountItem(w http.ResponseWriter, r *http.Request) {
+	if !s.accounts.Enabled() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "账号池存储未启用"}})
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/web/api/accounts/")
+	path = strings.Trim(path, "/")
+	if path == "" {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"message": "account not found"}})
+		return
+	}
+
+	parts := strings.Split(path, "/")
+	id := strings.TrimSpace(parts[0])
+	if id == "" {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"message": "account not found"}})
+		return
+	}
+
+	if len(parts) == 2 && parts[1] == "validate" {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": map[string]any{"message": "method not allowed"}})
+			return
+		}
+		account, err := s.accounts.Validate(r.Context(), id)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error()}})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": account})
+		return
+	}
+
+	if len(parts) != 1 {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"message": "account not found"}})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPatch:
+		var payload struct {
+			Label    *string `json:"label"`
+			Token    *string `json:"token"`
+			Enabled  *bool   `json:"enabled"`
+			Priority *int    `json:"priority"`
+			Weight   *int    `json:"weight"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "请求体不是合法 JSON"}})
+			return
+		}
+		account, err := s.accounts.Update(r.Context(), id, AccountUpdateInput{
+			Label:    payload.Label,
+			Token:    payload.Token,
+			Enabled:  payload.Enabled,
+			Priority: payload.Priority,
+			Weight:   payload.Weight,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error()}})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": account})
+	case http.MethodDelete:
+		if err := s.accounts.Delete(r.Context(), id); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error()}})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": map[string]any{"message": "method not allowed"}})
+	}
 }
 
 func cloneMap(input map[string]any) map[string]any {
@@ -366,9 +635,9 @@ func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
 	_, _ = w.Write(body)
 }
 
-func maxDuration(a, b time.Duration) time.Duration {
-	if a > b {
-		return a
+func requestIsSecure(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
 	}
-	return b
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }

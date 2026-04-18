@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Freebuff2API 控制台</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div class="noise"></div>
+    <main class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">FREEBUFF2API CONTROL CONSOLE</p>
+          <h1>前端壳、账号池、在线调试台</h1>
+          <p class="hero-copy">
+            单二进制运行。网页登录后即可查看 token 运行态、维护账号池并直接调试
+            OpenAI 兼容接口。
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="refreshButton" class="ghost-button">刷新数据</button>
+          <button id="logoutButton" class="ghost-button danger">退出登录</button>
+        </div>
+      </header>
+
+      <section class="overview-grid">
+        <article class="metric-card">
+          <span class="metric-label">服务状态</span>
+          <strong id="metricStatus">加载中</strong>
+          <small id="metricStarted">-</small>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">运行时长</span>
+          <strong id="metricUptime">-</strong>
+          <small>秒级快照</small>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">可用模型</span>
+          <strong id="metricModels">-</strong>
+          <small id="metricAccountsMode">账号池模式</small>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">活跃账号池</span>
+          <strong id="metricPools">-</strong>
+          <small>按优先级 + 权重轮转</small>
+        </article>
+      </section>
+
+      <section class="panel-grid">
+        <article class="panel panel-large">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">RUNTIME</p>
+              <h2>运行态快照</h2>
+            </div>
+            <span class="panel-tip">显示当前参与分配的 token 池与 run 状态</span>
+          </div>
+          <div id="runtimeState" class="runtime-grid"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">MODELS</p>
+              <h2>模型列表</h2>
+            </div>
+          </div>
+          <input id="modelSearch" class="text-input" type="search" placeholder="搜索模型" />
+          <div id="modelList" class="model-list"></div>
+        </article>
+      </section>
+
+      <section class="panel-grid">
+        <article class="panel panel-large">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">ACCOUNTS</p>
+              <h2>账号池管理</h2>
+            </div>
+            <span id="accountStoreBadge" class="badge">SQLite</span>
+          </div>
+
+          <form id="accountForm" class="account-form">
+            <input type="hidden" id="accountId" />
+            <label>
+              <span>账号标签</span>
+              <input id="accountLabel" class="text-input" type="text" placeholder="例如：主账号 / 备用账号" required />
+            </label>
+            <label class="account-token">
+              <span>Auth Token</span>
+              <textarea id="accountToken" class="text-area" rows="3" placeholder="粘贴 Freebuff Auth Token。编辑已有账号时可留空，表示不改 token。"></textarea>
+            </label>
+            <label>
+              <span>优先级</span>
+              <input id="accountPriority" class="text-input" type="number" value="100" min="0" />
+            </label>
+            <label>
+              <span>权重</span>
+              <input id="accountWeight" class="text-input" type="number" value="1" min="1" />
+            </label>
+            <label class="checkbox-line">
+              <input id="accountEnabled" type="checkbox" checked />
+              <span>保存后立即加入轮换池</span>
+            </label>
+            <div class="form-actions">
+              <button id="accountSubmitButton" class="primary-button" type="submit">新增账号</button>
+              <button id="accountResetButton" class="ghost-button" type="button">清空表单</button>
+            </div>
+          </form>
+
+          <div id="accountList" class="account-list"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">DEBUG</p>
+              <h2>在线调试台</h2>
+            </div>
+          </div>
+
+          <form id="debugForm" class="debug-form">
+            <label>
+              <span>模型</span>
+              <select id="debugModel" class="text-input"></select>
+            </label>
+            <label>
+              <span>系统消息</span>
+              <textarea id="debugSystem" class="text-area" rows="2" placeholder="可选"></textarea>
+            </label>
+            <label>
+              <span>用户消息</span>
+              <textarea id="debugPrompt" class="text-area" rows="6" placeholder="输入一条调试消息" required></textarea>
+            </label>
+            <label class="checkbox-line">
+              <input id="debugStream" type="checkbox" checked />
+              <span>使用流式响应</span>
+            </label>
+            <div class="form-actions">
+              <button id="debugSubmitButton" class="primary-button" type="submit">发送请求</button>
+              <button id="debugAbortButton" class="ghost-button danger" type="button">中止请求</button>
+            </div>
+          </form>
+
+          <div class="debug-output">
+            <div class="output-head">
+              <span>响应预览</span>
+              <button id="copyOutputButton" class="ghost-button small" type="button">复制输出</button>
+            </div>
+            <pre id="debugOutput" class="output-pre">等待请求...</pre>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" aria-live="polite"></div>
+
+    <div id="loginOverlay" class="login-overlay">
+      <div class="login-card">
+        <p class="eyebrow">ACCESS GATE</p>
+        <h2>输入访问密码</h2>
+        <p class="login-copy">控制台通过访问密码进入，API 兼容端点仍按原有 Bearer Key 规则工作。</p>
+        <form id="loginForm">
+          <label>
+            <span>访问密码</span>
+            <input id="loginPassword" class="text-input" type="password" autocomplete="current-password" required />
+          </label>
+          <button class="primary-button" type="submit">进入控制台</button>
+        </form>
+      </div>
+    </div>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,19 +15,27 @@ import (
 type RunManager struct {
 	cfg    Config
 	logger *log.Logger
-	pools  []*tokenPool
-	next   atomic.Uint64
+	client *UpstreamClient
+
+	mu           sync.RWMutex
+	activePools  map[string]*tokenPool
+	retiredPools []*tokenPool
+	next         atomic.Uint64
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
 
 type tokenPool struct {
-	name   string
-	token  string
-	cfg    Config
-	client *UpstreamClient
-	logger *log.Logger
+	accountID string
+	label     string
+	token     string
+	cfg       Config
+	client    *UpstreamClient
+	logger    *log.Logger
+	priority  int
+	weight    int
+	retired   bool
 
 	mu            sync.Mutex
 	runs          map[string]*managedRun // agentID → current run
@@ -50,10 +59,13 @@ type runLease struct {
 }
 
 type tokenSnapshot struct {
+	ID            string        `json:"id"`
 	Name          string        `json:"name"`
+	Priority      int           `json:"priority"`
+	Weight        int           `json:"weight"`
 	Runs          []runSnapshot `json:"runs"`
 	DrainingRuns  int           `json:"draining_runs"`
-	CooldownUntil time.Time    `json:"cooldown_until,omitempty"`
+	CooldownUntil time.Time     `json:"cooldown_until,omitempty"`
 	LastError     string        `json:"last_error,omitempty"`
 }
 
@@ -66,32 +78,16 @@ type runSnapshot struct {
 }
 
 func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunManager {
-	pools := make([]*tokenPool, 0, len(cfg.AuthTokens))
-	for index, token := range cfg.AuthTokens {
-		pools = append(pools, &tokenPool{
-			name:   fmt.Sprintf("token-%d", index+1),
-			token:  token,
-			cfg:    cfg,
-			client: client,
-			runs:   make(map[string]*managedRun),
-			logger: logger,
-		})
-	}
-
 	return &RunManager{
-		cfg:    cfg,
-		logger: logger,
-		pools:  pools,
-		stopCh: make(chan struct{}),
+		cfg:         cfg,
+		logger:      logger,
+		client:      client,
+		activePools: make(map[string]*tokenPool),
+		stopCh:      make(chan struct{}),
 	}
 }
 
 func (m *RunManager) Start(ctx context.Context) {
-	// Pre-warm runs for all tracked agents in background.
-	// The server is already listening; if a request arrives before
-	// pre-warming finishes, acquire() will lazily create the run.
-	go m.prewarm()
-
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
@@ -102,11 +98,7 @@ func (m *RunManager) Start(ctx context.Context) {
 			select {
 			case <-ticker.C:
 				maintainCtx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
-				for _, pool := range m.pools {
-					if err := pool.maintain(maintainCtx); err != nil {
-						m.logger.Printf("%s: maintenance failed: %v", pool.name, err)
-					}
-				}
+				m.maintainAll(maintainCtx)
 				cancel()
 			case <-m.stopCh:
 				return
@@ -115,45 +107,138 @@ func (m *RunManager) Start(ctx context.Context) {
 	}()
 }
 
-func (m *RunManager) prewarm() {
-	ctx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
-	defer cancel()
+func (m *RunManager) SyncAccounts(ctx context.Context, accounts []RuntimeAccount) error {
+	desired := make(map[string]RuntimeAccount, len(accounts))
+	for _, account := range accounts {
+		if strings.TrimSpace(account.ID) == "" || strings.TrimSpace(account.Token) == "" {
+			continue
+		}
+		if account.Weight <= 0 {
+			account.Weight = 1
+		}
+		desired[account.ID] = account
+	}
 
-	for _, pool := range m.pools {
-		for _, agentID := range trackedAgents {
-			if err := pool.rotateAgent(ctx, agentID); err != nil {
-				m.logger.Printf("%s: prewarm %s failed: %v", pool.name, agentID, err)
-			} else {
-				m.logger.Printf("%s: prewarmed %s", pool.name, agentID)
-			}
+	var prewarm []*tokenPool
+
+	m.mu.Lock()
+	for id, account := range desired {
+		existing, ok := m.activePools[id]
+		if ok && existing.token == account.Token {
+			existing.label = account.Label
+			existing.priority = account.Priority
+			existing.weight = account.Weight
+			existing.retired = false
+			continue
+		}
+
+		pool := newTokenPool(account, m.cfg, m.client, m.logger)
+		m.activePools[id] = pool
+		prewarm = append(prewarm, pool)
+
+		if ok {
+			existing.retired = true
+			m.retiredPools = append(m.retiredPools, existing)
 		}
 	}
+
+	for id, pool := range m.activePools {
+		if _, ok := desired[id]; ok {
+			continue
+		}
+		delete(m.activePools, id)
+		pool.retired = true
+		m.retiredPools = append(m.retiredPools, pool)
+	}
+	m.mu.Unlock()
+
+	for _, pool := range prewarm {
+		if err := pool.prewarm(ctx); err != nil {
+			m.logger.Printf("%s: prewarm failed: %v", pool.label, err)
+		}
+	}
+	return nil
+}
+
+func (m *RunManager) maintainAll(ctx context.Context) {
+	m.mu.RLock()
+	active := make([]*tokenPool, 0, len(m.activePools))
+	for _, pool := range m.activePools {
+		active = append(active, pool)
+	}
+	retired := append([]*tokenPool(nil), m.retiredPools...)
+	m.mu.RUnlock()
+
+	for _, pool := range active {
+		if err := pool.maintain(ctx, true); err != nil {
+			m.logger.Printf("%s: maintenance failed: %v", pool.label, err)
+		}
+	}
+	for _, pool := range retired {
+		if err := pool.maintain(ctx, false); err != nil {
+			m.logger.Printf("%s: retired maintenance failed: %v", pool.label, err)
+		}
+	}
+
+	m.mu.Lock()
+	filtered := m.retiredPools[:0]
+	for _, pool := range m.retiredPools {
+		if !pool.isIdle() {
+			filtered = append(filtered, pool)
+		}
+	}
+	m.retiredPools = filtered
+	m.mu.Unlock()
 }
 
 func (m *RunManager) Close(ctx context.Context) {
 	close(m.stopCh)
 	m.wg.Wait()
-	for _, pool := range m.pools {
+
+	m.mu.RLock()
+	allPools := make([]*tokenPool, 0, len(m.activePools)+len(m.retiredPools))
+	for _, pool := range m.activePools {
+		allPools = append(allPools, pool)
+	}
+	allPools = append(allPools, m.retiredPools...)
+	m.mu.RUnlock()
+
+	var errs []string
+	for _, pool := range allPools {
 		if err := pool.shutdown(ctx); err != nil {
-			m.logger.Printf("%s: shutdown failed: %v", pool.name, err)
+			errs = append(errs, err.Error())
 		}
+	}
+	if len(errs) > 0 {
+		m.logger.Printf("run manager shutdown errors: %s", strings.Join(errs, "; "))
 	}
 }
 
 func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, error) {
-	if len(m.pools) == 0 {
+	m.mu.RLock()
+	candidates := make([]*tokenPool, 0, len(m.activePools))
+	for _, pool := range m.activePools {
+		candidates = append(candidates, pool)
+	}
+	m.mu.RUnlock()
+
+	if len(candidates) == 0 {
 		return nil, errors.New("no auth tokens configured")
 	}
 
-	startIndex := int(m.next.Add(1)-1) % len(m.pools)
-	var errs []string
-	for offset := 0; offset < len(m.pools); offset++ {
-		pool := m.pools[(startIndex+offset)%len(m.pools)]
-		lease, err := pool.acquire(ctx, agentID)
-		if err == nil {
-			return lease, nil
+	var (
+		errs []string
+		seed = m.next.Add(1) - 1
+	)
+
+	for _, group := range groupPoolsByPriority(candidates) {
+		for _, pool := range weightedPoolOrder(group, seed) {
+			lease, err := pool.acquire(ctx, agentID)
+			if err == nil {
+				return lease, nil
+			}
+			errs = append(errs, fmt.Sprintf("%s: %v", pool.label, err))
 		}
-		errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
 	}
 
 	return nil, fmt.Errorf("unable to acquire run from any token (%s)", strings.Join(errs, "; "))
@@ -181,11 +266,54 @@ func (m *RunManager) Cooldown(lease *runLease, duration time.Duration, reason st
 }
 
 func (m *RunManager) Snapshots() []tokenSnapshot {
-	snapshots := make([]tokenSnapshot, 0, len(m.pools))
-	for _, pool := range m.pools {
+	m.mu.RLock()
+	pools := make([]*tokenPool, 0, len(m.activePools))
+	for _, pool := range m.activePools {
+		pools = append(pools, pool)
+	}
+	m.mu.RUnlock()
+
+	sort.Slice(pools, func(i, j int) bool {
+		if pools[i].priority != pools[j].priority {
+			return pools[i].priority > pools[j].priority
+		}
+		if pools[i].weight != pools[j].weight {
+			return pools[i].weight > pools[j].weight
+		}
+		return pools[i].label < pools[j].label
+	})
+
+	snapshots := make([]tokenSnapshot, 0, len(pools))
+	for _, pool := range pools {
 		snapshots = append(snapshots, pool.snapshot())
 	}
 	return snapshots
+}
+
+func newTokenPool(account RuntimeAccount, cfg Config, client *UpstreamClient, logger *log.Logger) *tokenPool {
+	if account.Weight <= 0 {
+		account.Weight = 1
+	}
+	return &tokenPool{
+		accountID: account.ID,
+		label:     account.Label,
+		token:     account.Token,
+		cfg:       cfg,
+		client:    client,
+		logger:    logger,
+		priority:  account.Priority,
+		weight:    account.Weight,
+		runs:      make(map[string]*managedRun),
+	}
+}
+
+func (p *tokenPool) prewarm(ctx context.Context) error {
+	for _, agentID := range trackedAgents {
+		if err := p.rotateAgent(ctx, agentID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, error) {
@@ -216,12 +344,19 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 	return &runLease{pool: p, run: run}, nil
 }
 
-func (p *tokenPool) maintain(ctx context.Context) error {
+func (p *tokenPool) maintain(ctx context.Context, allowRotate bool) error {
 	p.mu.Lock()
 	var toRotate []string
-	for agentID, run := range p.runs {
-		if time.Since(run.startedAt) >= p.cfg.RotationInterval {
-			toRotate = append(toRotate, agentID)
+	var toFinish []*managedRun
+	if allowRotate {
+		for agentID, run := range p.runs {
+			if time.Since(run.startedAt) >= p.cfg.RotationInterval {
+				toRotate = append(toRotate, agentID)
+			}
+		}
+	} else {
+		for _, run := range p.runs {
+			toFinish = append(toFinish, run)
 		}
 	}
 	draining := append([]*managedRun(nil), p.draining...)
@@ -229,13 +364,17 @@ func (p *tokenPool) maintain(ctx context.Context) error {
 
 	for _, agentID := range toRotate {
 		if err := p.rotateAgent(ctx, agentID); err != nil {
-			p.logger.Printf("%s: rotate agent %s failed: %v", p.name, agentID, err)
+			p.logger.Printf("%s: rotate agent %s failed: %v", p.label, agentID, err)
 		}
 	}
-
 	for _, run := range draining {
 		if err := p.finishIfReady(run); err != nil {
-			p.logger.Printf("%s: finish draining run %s failed: %v", p.name, run.id, err)
+			p.logger.Printf("%s: finish draining run %s failed: %v", p.label, run.id, err)
+		}
+	}
+	for _, run := range toFinish {
+		if err := p.finishIfReady(run); err != nil {
+			p.logger.Printf("%s: finish retired run %s failed: %v", p.label, run.id, err)
 		}
 	}
 	return nil
@@ -297,7 +436,7 @@ func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
 	if oldRun != nil {
 		go func(run *managedRun) {
 			if err := p.finishIfReady(run); err != nil {
-				p.logger.Printf("%s: finish rotated run %s (agent %s) failed: %v", p.name, run.id, run.agentID, err)
+				p.logger.Printf("%s: finish rotated run %s (agent %s) failed: %v", p.label, run.id, run.agentID, err)
 			}
 		}(oldRun)
 	}
@@ -316,7 +455,7 @@ func (p *tokenPool) release(run *managedRun) {
 	p.mu.Unlock()
 
 	if err := p.finishIfReady(run); err != nil {
-		p.logger.Printf("%s: finish released run %s failed: %v", p.name, run.id, err)
+		p.logger.Printf("%s: finish released run %s failed: %v", p.label, run.id, err)
 	}
 }
 
@@ -326,8 +465,7 @@ func (p *tokenPool) finishIfReady(run *managedRun) error {
 		p.mu.Unlock()
 		return nil
 	}
-	// Only finish if this run is no longer the current run for its agent
-	if current, ok := p.runs[run.agentID]; ok && current == run {
+	if current, ok := p.runs[run.agentID]; ok && current == run && !p.retired {
 		p.mu.Unlock()
 		return nil
 	}
@@ -346,6 +484,9 @@ func (p *tokenPool) finishIfReady(run *managedRun) error {
 	}
 
 	p.mu.Lock()
+	if current, ok := p.runs[run.agentID]; ok && current == run {
+		delete(p.runs, run.agentID)
+	}
 	filtered := p.draining[:0]
 	for _, drainingRun := range p.draining {
 		if drainingRun != run {
@@ -361,7 +502,6 @@ func (p *tokenPool) invalidate(run *managedRun, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Remove from current runs if it matches
 	if current, ok := p.runs[run.agentID]; ok && current == run {
 		delete(p.runs, run.agentID)
 	}
@@ -395,7 +535,10 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 	defer p.mu.Unlock()
 
 	snapshot := tokenSnapshot{
-		Name:          p.name,
+		ID:            p.accountID,
+		Name:          p.label,
+		Priority:      p.priority,
+		Weight:        p.weight,
 		DrainingRuns:  len(p.draining),
 		CooldownUntil: p.cooldownUntil,
 		LastError:     p.lastError,
@@ -409,5 +552,81 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 			RequestCount: run.requestCount,
 		})
 	}
+	sort.Slice(snapshot.Runs, func(i, j int) bool {
+		return snapshot.Runs[i].AgentID < snapshot.Runs[j].AgentID
+	})
 	return snapshot
+}
+
+func (p *tokenPool) isIdle() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.draining) > 0 {
+		return false
+	}
+	for _, run := range p.runs {
+		if run.inflight > 0 {
+			return false
+		}
+		return false
+	}
+	return true
+}
+
+func groupPoolsByPriority(pools []*tokenPool) [][]*tokenPool {
+	groups := make(map[int][]*tokenPool)
+	priorities := make([]int, 0)
+	for _, pool := range pools {
+		groups[pool.priority] = append(groups[pool.priority], pool)
+	}
+	for priority := range groups {
+		priorities = append(priorities, priority)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(priorities)))
+
+	ordered := make([][]*tokenPool, 0, len(priorities))
+	for _, priority := range priorities {
+		group := groups[priority]
+		sort.Slice(group, func(i, j int) bool {
+			if group[i].weight != group[j].weight {
+				return group[i].weight > group[j].weight
+			}
+			return group[i].label < group[j].label
+		})
+		ordered = append(ordered, group)
+	}
+	return ordered
+}
+
+func weightedPoolOrder(pools []*tokenPool, seed uint64) []*tokenPool {
+	if len(pools) <= 1 {
+		return pools
+	}
+
+	var expanded []*tokenPool
+	for _, pool := range pools {
+		repeat := pool.weight
+		if repeat <= 0 {
+			repeat = 1
+		}
+		for i := 0; i < repeat; i++ {
+			expanded = append(expanded, pool)
+		}
+	}
+	if len(expanded) == 0 {
+		return pools
+	}
+
+	start := int(seed % uint64(len(expanded)))
+	ordered := make([]*tokenPool, 0, len(pools))
+	seen := make(map[*tokenPool]struct{}, len(pools))
+	for offset := 0; offset < len(expanded); offset++ {
+		pool := expanded[(start+offset)%len(expanded)]
+		if _, ok := seen[pool]; ok {
+			continue
+		}
+		seen[pool] = struct{}{}
+		ordered = append(ordered, pool)
+	}
+	return ordered
 }

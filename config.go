@@ -12,24 +12,30 @@ import (
 )
 
 type Config struct {
-	ListenAddr       string
-	UpstreamBaseURL  string
-	AuthTokens       []string
-	RotationInterval time.Duration
-	RequestTimeout   time.Duration
-	UserAgent        string
-	APIKeys          []string
-	HTTPProxy        string
+	ListenAddr        string
+	UpstreamBaseURL   string
+	AuthTokens        []string
+	RotationInterval  time.Duration
+	RequestTimeout    time.Duration
+	UserAgent         string
+	APIKeys           []string
+	HTTPProxy         string
+	WebPassword       string
+	DataDBPath        string
+	DataEncryptionKey string
 }
 
 type rawConfig struct {
-	ListenAddr       string   `json:"LISTEN_ADDR"`
-	UpstreamBaseURL  string   `json:"UPSTREAM_BASE_URL"`
-	AuthTokens       []string `json:"AUTH_TOKENS"`
-	RotationInterval string   `json:"ROTATION_INTERVAL"`
-	RequestTimeout   string   `json:"REQUEST_TIMEOUT"`
-	APIKeys          []string `json:"API_KEYS"`
-	HTTPProxy        string   `json:"HTTP_PROXY"`
+	ListenAddr        string   `json:"LISTEN_ADDR"`
+	UpstreamBaseURL   string   `json:"UPSTREAM_BASE_URL"`
+	AuthTokens        []string `json:"AUTH_TOKENS"`
+	RotationInterval  string   `json:"ROTATION_INTERVAL"`
+	RequestTimeout    string   `json:"REQUEST_TIMEOUT"`
+	APIKeys           []string `json:"API_KEYS"`
+	HTTPProxy         string   `json:"HTTP_PROXY"`
+	WebPassword       string   `json:"WEB_PASSWORD"`
+	DataDBPath        string   `json:"DATA_DB_PATH"`
+	DataEncryptionKey string   `json:"DATA_ENCRYPTION_KEY"`
 }
 
 func loadConfig(configPath string) (Config, error) {
@@ -45,6 +51,9 @@ func loadConfig(configPath string) (Config, error) {
 	overrideCSV(&cfg.AuthTokens, "AUTH_TOKENS")
 	overrideCSV(&cfg.APIKeys, "API_KEYS")
 	overrideString(&cfg.HTTPProxy, "HTTP_PROXY")
+	overrideString(&cfg.WebPassword, "WEB_PASSWORD")
+	overrideString(&cfg.DataDBPath, "DATA_DB_PATH")
+	overrideString(&cfg.DataEncryptionKey, "DATA_ENCRYPTION_KEY")
 
 	rotationInterval, err := time.ParseDuration(strings.TrimSpace(cfg.RotationInterval))
 	if err != nil {
@@ -57,14 +66,21 @@ func loadConfig(configPath string) (Config, error) {
 	}
 
 	finalCfg := Config{
-		ListenAddr:       strings.TrimSpace(cfg.ListenAddr),
-		UpstreamBaseURL:  strings.TrimRight(strings.TrimSpace(cfg.UpstreamBaseURL), "/"),
-		AuthTokens:       dedupeStrings(cfg.AuthTokens),
-		RotationInterval: rotationInterval,
-		RequestTimeout:   requestTimeout,
-		UserAgent:        generateUserAgent(),
-		APIKeys:          dedupeStrings(cfg.APIKeys),
-		HTTPProxy:        strings.TrimSpace(cfg.HTTPProxy),
+		ListenAddr:        strings.TrimSpace(cfg.ListenAddr),
+		UpstreamBaseURL:   strings.TrimRight(strings.TrimSpace(cfg.UpstreamBaseURL), "/"),
+		AuthTokens:        dedupeStrings(cfg.AuthTokens),
+		RotationInterval:  rotationInterval,
+		RequestTimeout:    requestTimeout,
+		UserAgent:         generateUserAgent(),
+		APIKeys:           dedupeStrings(cfg.APIKeys),
+		HTTPProxy:         strings.TrimSpace(cfg.HTTPProxy),
+		WebPassword:       strings.TrimSpace(cfg.WebPassword),
+		DataDBPath:        strings.TrimSpace(cfg.DataDBPath),
+		DataEncryptionKey: strings.TrimSpace(cfg.DataEncryptionKey),
+	}
+
+	if finalCfg.DataEncryptionKey != "" && finalCfg.DataDBPath == "" {
+		finalCfg.DataDBPath = filepath.Join("data", "freebuff2api.db")
 	}
 
 	switch {
@@ -72,15 +88,17 @@ func loadConfig(configPath string) (Config, error) {
 		return Config{}, errors.New("LISTEN_ADDR cannot be empty")
 	case finalCfg.UpstreamBaseURL == "":
 		return Config{}, errors.New("UPSTREAM_BASE_URL cannot be empty")
-	case len(finalCfg.AuthTokens) == 0:
-		return Config{}, errors.New("at least one AUTH_TOKENS is required")
+	case len(finalCfg.AuthTokens) == 0 && finalCfg.DataDBPath == "":
+		return Config{}, errors.New("at least one AUTH_TOKENS is required unless DATA_DB_PATH is configured")
 	case finalCfg.RotationInterval <= 0:
 		return Config{}, errors.New("ROTATION_INTERVAL must be greater than zero")
 	case finalCfg.RequestTimeout <= 0:
 		return Config{}, errors.New("REQUEST_TIMEOUT must be greater than zero")
+	case finalCfg.DataDBPath != "" && finalCfg.DataEncryptionKey == "":
+		return Config{}, errors.New("DATA_ENCRYPTION_KEY is required when DATA_DB_PATH is configured")
+	case finalCfg.WebPassword != "" && finalCfg.DataEncryptionKey == "":
+		return Config{}, errors.New("DATA_ENCRYPTION_KEY is required when WEB_PASSWORD is configured")
 	}
-
-
 
 	return finalCfg, nil
 }

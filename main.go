@@ -36,13 +36,38 @@ func main() {
 		transport.Proxy = http.ProxyURL(importURL)
 	}
 	httpClient := &http.Client{Transport: transport, Timeout: 15 * time.Second}
-	
+
 	registry := NewModelRegistry(httpClient, logger)
 	registry.Start(context.Background())
 	defer registry.Stop()
 
-	server := NewServer(cfg, logger, registry)
+	upstreamClient := NewUpstreamClient(cfg)
+	runManager := NewRunManager(cfg, upstreamClient, logger)
+	var accountStore *AccountStore
+	if cfg.DataDBPath != "" {
+		accountStore, err = OpenAccountStore(cfg.DataDBPath, NewTokenCipher(cfg.DataEncryptionKey))
+		if err != nil {
+			logger.Fatalf("open account store: %v", err)
+		}
+		defer accountStore.Close()
+	}
+
+	accountManager := NewAccountManager(cfg, logger, accountStore, upstreamClient, runManager)
 	startCtx, cancelStart := context.WithTimeout(context.Background(), cfg.RequestTimeout)
+	if err := accountManager.Bootstrap(startCtx); err != nil {
+		cancelStart()
+		logger.Fatalf("bootstrap accounts: %v", err)
+	}
+
+	server := NewServer(
+		cfg,
+		logger,
+		registry,
+		upstreamClient,
+		runManager,
+		accountManager,
+		NewSessionManager(cfg.WebPassword, 24*time.Hour),
+	)
 	server.Start(startCtx)
 	cancelStart()
 
